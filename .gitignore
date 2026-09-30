@@ -1,0 +1,6 @@
+venv310/
+outputs/
+.venv/
+ss/
+__pycache__/
+*.pyc
