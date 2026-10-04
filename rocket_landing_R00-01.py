@@ -388,26 +388,29 @@ NORM_SCALES = np.array([30.0, 15.0, 10.0, 2.0, np.radians(45.0), 5.0], dtype=np.
 def normalize_state(state: np.ndarray) -> np.ndarray:
     return (state / NORM_SCALES).astype(np.float32)
 
-
+# curriculum stages (x_range, vx_range, theta_range, omega_range) — easiest to hardest; agent advances once success rate clears the threshold
 CURRICULUM_STAGES = [
     (3.0, 0.5, np.radians(5.0), 0.10),
     (5.0, 0.75, np.radians(12.0), 0.20),
     (7.0, 1.0, np.radians(20.0), 0.35),
     (10.0, 1.5, np.radians(30.0), 0.50),
 ]
+
+# curriculum/training control constants: success threshold & min episodes to advance a stage, rolling window size, min episodes at final stage, diagnostic print frequency
 CURRICULUM_SUCCESS_THRESHOLD = 45.0
 CURRICULUM_MIN_EPISODES_PER_STAGE = 300
 SUCCESS_WINDOW_SIZE = 100
 FINAL_STAGE_MIN_EPISODES = 1200
 DIAGNOSTIC_INTERVAL = 2000
 
+# entropy coefficient schedule per head (start, end), linearly decayed over training; torque gets stronger/longer exploration pressure since it's continuous
 HEAD_ENTROPY_SCHEDULE = {
     "main":    (0.05, 0.005),
     "lateral": (0.05, 0.005),
     "torque":  (0.08, 0.01),
 }
 
-
+# sanity check: sample many states, bucket by tilt direction, verify torque sign opposes the lean (not stuck at a fixed value regardless of state)
 def diagnose_torque_behavior(env, actor, num_samples=300, theta_deadband_deg=1.0):
     deadband = np.radians(theta_deadband_deg)
     buckets = {"theta>0": [], "theta<0": [], "theta~0": []}
@@ -416,6 +419,7 @@ def diagnose_torque_behavior(env, actor, num_samples=300, theta_deadband_deg=1.0
         state, _ = env.reset()
         theta = state[4]
         state_tensor = torch.FloatTensor(normalize_state(state)).unsqueeze(0)
+        # no_grad: just observing the policy's output here, not training — skip building the gradient graph to save memory/compute
         with torch.no_grad():
             action = greedy_actions(actor, state_tensor)
         torque_fraction = action[2]
@@ -440,6 +444,7 @@ def diagnose_torque_behavior(env, actor, num_samples=300, theta_deadband_deg=1.0
 
 def train(env, actor, critic_lin, critic_rot, actor_optimizer, critic_optimizer,
           episodes=6000, batch_size=32):
+    # clear any pre-existing gradients before accumulation starts across episodes
     actor_optimizer.zero_grad()
     critic_optimizer.zero_grad()
 
@@ -460,6 +465,7 @@ def train(env, actor, critic_lin, critic_rot, actor_optimizer, critic_optimizer,
         episode += 1
 
         frac = episode / episodes
+        # compute this episode's entropy coefficients by interpolating each head's schedule based on training progress (frac)
         ent_coef = {
             head: start + (end - start) * frac
             for head, (start, end) in HEAD_ENTROPY_SCHEDULE.items()
@@ -474,10 +480,13 @@ def train(env, actor, critic_lin, critic_rot, actor_optimizer, critic_optimizer,
         last_info = {}
 
         while not done:
+            # normalize + convert to tensor, then add a batch dimension (shape (6,) -> (1,6)) since the network expects batched input
             state_tensor = torch.FloatTensor(normalize_state(state)).unsqueeze(0)
 
+            # get each critic's value estimate for this state (expected future reward_lin / reward_rot from here onward)
             val_lin = critic_lin(state_tensor)
             val_rot = critic_rot(state_tensor)
+            # sample this step's action from the current policy, plus log-probs/entropies (for the loss) and torque std (for logging)
             action_array, log_probs, entropies, std_t = sample_actions(actor, state_tensor)
 
             next_state, reward, terminated, truncated, info = env.step(action_array)
@@ -497,6 +506,7 @@ def train(env, actor, critic_lin, critic_rot, actor_optimizer, critic_optimizer,
 
             state = next_state
 
+        # recombine per-step linear + rotational rewards into one total, just for the episode's printed summary (not used in training math)
         total_rewards = [l + r for l, r in zip(rewards_lin, rewards_rot)]
 
         episode_success = last_info.get("landed_success", False)
@@ -524,6 +534,8 @@ def train(env, actor, critic_lin, critic_rot, actor_optimizer, critic_optimizer,
 
         discounted_lin = compute_discounted_rewards(rewards_lin)
         discounted_rot = compute_discounted_rewards(rewards_rot)
+
+        # merge each list of per-step tensors into one tensor; squeeze critic outputs to match discounted-reward shape; entropy is averaged across the episode, log-probs kept per-step
         values_lin_t = torch.cat(values_lin).squeeze(-1)
         values_rot_t = torch.cat(values_rot).squeeze(-1)
 
@@ -535,8 +547,11 @@ def train(env, actor, critic_lin, critic_rot, actor_optimizer, critic_optimizer,
         entropy_lateral = torch.cat(entropies_lateral).mean()
         entropy_torque = torch.cat(entropies_torque).mean()
 
+        # advantage = actual return - critic's predicted value; detached so actor's loss doesn't backprop into the critic's weights
         advantages_lin = (discounted_lin - values_lin_t).detach()
         advantages_rot = (discounted_rot - values_rot_t).detach()
+
+
         if len(advantages_lin) > 1:
             advantages_lin = (advantages_lin - advantages_lin.mean()) / (advantages_lin.std() + 1e-5)
         if len(advantages_rot) > 1:
@@ -552,12 +567,15 @@ def train(env, actor, critic_lin, critic_rot, actor_optimizer, critic_optimizer,
             + (log_probs_torque_t * advantages_rot).sum()
         ) - entropy_bonus
 
+        # critic loss: how far off each critic's value prediction was from the actual discounted return (Smooth L1); both critics trained together via one combined loss
         critic_loss = (nn.SmoothL1Loss()(values_lin_t, discounted_lin)
                        + nn.SmoothL1Loss()(values_rot_t, discounted_rot))
 
+        # accumulate this episode's gradients (divided by batch_size so accumulation averages rather than sums); actual weight update happens every batch_size episodes
         (actor_loss / batch_size).backward()
         (critic_loss / batch_size).backward()
 
+        # every batch_size episodes: clip accumulated gradients (cap update size), apply the update, then reset gradients for the next accumulation cycle
         if episode % batch_size == 0:
             nn.utils.clip_grad_norm_(actor.parameters(), max_norm=0.5)
             nn.utils.clip_grad_norm_(list(critic_lin.parameters()) + list(critic_rot.parameters()), max_norm=0.5)
@@ -607,6 +625,7 @@ def train(env, actor, critic_lin, critic_rot, actor_optimizer, critic_optimizer,
                   f"(want >= {FINAL_STAGE_MIN_EPISODES}). Adding {extra} more episodes...")
 
 
+# run num_tests greedy (deterministic) episodes, print a summary each, and save a 5-panel telemetry plot from the first run
 def evaluate_and_plot(env, actor, num_tests=5):
     for test_idx in range(1, num_tests + 1):
         state, _ = env.reset()
@@ -697,7 +716,7 @@ def evaluate_and_plot(env, actor, num_tests=5):
             plt.savefig(os.path.join(OUTPUT_DIR, "evaluation_telemetry_stageB.png"), dpi=120)
             plt.close(fig)
 
-
+# test the trained policy on spawn conditions slightly beyond the hardest curriculum stage (wider theta/omega); this produces the CV's out-of-distribution success rate
 def evaluate_generalization(env, actor, num_tests=50, x_range=10.0, vx_range=1.5,
                              theta_range=np.radians(35.0), omega_range=0.6):
     env.set_spawn_range(x_range, vx_range, theta_range, omega_range)
@@ -740,7 +759,7 @@ def evaluate_generalization(env, actor, num_tests=50, x_range=10.0, vx_range=1.5
           f"Avg |miss_vx|: {avg_miss_vx:.2f}m/s | Avg final Vy: {avg_final_vy:.2f}m/s | "
           f"Avg final Theta: {avg_final_theta:.1f}deg\n")
 
-
+# scripted PD-controlled flight (no RL) to sanity-check the physics before training: bang-bang main/lateral thrust, proportional-derivative torque control
 def validate_stage_b(env: gym.Env, num_episodes: int = 3, kp: float = 3.0, kd: float = 1.0):
     for ep in range(1, num_episodes + 1):
         state, _ = env.reset()
